@@ -8,68 +8,76 @@ from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmb
 from langchain.chains.question_answering import load_qa_chain
 from langchain.prompts import PromptTemplate
 from dotenv import load_dotenv
+from multiprocessing import Pool
+import pickle
+import hashlib
 
 load_dotenv()
 os.getenv("GOOGLE_API_KEY")
 genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 
+def extract_text_from_pdf(file_path):
+    try:
+        with open(file_path, 'rb') as file:
+            pdf_reader = PdfReader(file)
+            return ''.join(page.extract_text() or '' for page in pdf_reader.pages)
+    except Exception as e:
+        st.error(f"Error processing '{file_path}': {str(e)}")
+        return ""
+
 @st.cache_data
 def get_pdf_text_from_resources():
-    text = ""
     resources_folder = "Resources"
-
-    st.write(f"Current working directory: {os.getcwd()}")
-    st.write(f"Checking for Resources folder: {os.path.abspath(resources_folder)}")
-
     if not os.path.exists(resources_folder):
         st.error(f"The '{resources_folder}' directory does not exist.")
         return None
 
-    all_files = os.listdir(resources_folder)
-    st.write(f"All files in Resources folder: {all_files}")
-
-    pdf_files = [f for f in all_files if f.lower().endswith('.pdf')]
-
+    pdf_files = [os.path.join(resources_folder, f) for f in os.listdir(resources_folder) if f.lower().endswith('.pdf')]
     if not pdf_files:
         st.warning(f"No PDF files found in the '{resources_folder}' directory.")
         return None
 
-    st.write(f"PDF files found: {pdf_files}")
+    # Calculate hash of PDF files to use as cache key
+    pdf_hash = hashlib.md5(''.join(pdf_files).encode()).hexdigest()
+    cache_file = f"pdf_cache_{pdf_hash}.pkl"
 
-    for filename in pdf_files:
-        file_path = os.path.join(resources_folder, filename)
-        st.write(f"Processing file: {file_path}")
-        try:
-            pdf_reader = PdfReader(file_path)
-            for page_num, page in enumerate(pdf_reader.pages):
-                page_text = page.extract_text()
-                if page_text:
-                    text += page_text
-                    st.write(f"Extracted text from page {page_num + 1} of {filename}")
-                else:
-                    st.warning(f"No text could be extracted from page {page_num + 1} of '{filename}'. The page might be scanned or image-based.")
-        except Exception as e:
-            st.error(f"Error processing '{filename}': {str(e)}")
+    if os.path.exists(cache_file):
+        with open(cache_file, 'rb') as f:
+            return pickle.load(f)
 
-    if not text:
+    combined_text = ""
+    progress_bar = st.progress(0)
+    for i, pdf_file in enumerate(pdf_files):
+        text = extract_text_from_pdf(pdf_file)
+        combined_text += text
+        progress = (i + 1) / len(pdf_files)
+        progress_bar.progress(progress)
+
+    if not combined_text:
         st.warning("No text could be extracted from any of the PDF files.")
         return None
 
-    st.write(f"Total characters extracted: {len(text)}")
-    return text
+    with open(cache_file, 'wb') as f:
+        pickle.dump(combined_text, f)
+
+    return combined_text
 
 @st.cache_data
 def get_text_chunks(text):
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=10000, chunk_overlap=1000)
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=5000, chunk_overlap=500)
     chunks = text_splitter.split_text(text)
     return chunks
 
 @st.cache_resource
+def get_embeddings():
+    return GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+
 def get_vector_store(text_chunks):
-    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+    embeddings = get_embeddings()
     vector_store = FAISS.from_texts(text_chunks, embedding=embeddings)
     return vector_store
 
+@st.cache_resource
 def get_conversational_chain():
     prompt_template = """
     Context:\n {context}?\n
@@ -82,21 +90,17 @@ def get_conversational_chain():
     """
 
     model = ChatGoogleGenerativeAI(model="gemini-pro", temperature=0.3)
-
     prompt = PromptTemplate(template=prompt_template, input_variables=["context", "question", "audience"])
     chain = load_qa_chain(model, chain_type="stuff", prompt=prompt)
-
     return chain
 
 def user_input(user_question, audience, vector_store):
     docs = vector_store.similarity_search(user_question)
-
     chain = get_conversational_chain()
-
     response = chain(
-        {"input_documents": docs, "question": user_question, "audience": audience}
-        , return_only_outputs=True)
-
+        {"input_documents": docs, "question": user_question, "audience": audience},
+        return_only_outputs=True
+    )
     return response["output_text"]
 
 def format_response(response, audience):
